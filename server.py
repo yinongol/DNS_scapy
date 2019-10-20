@@ -1,7 +1,7 @@
 from scapy.all import *
 import hashlib
 hasher=hashlib.md5()
-dstip=input("enter destination ip"
+dstip=input("enter destination ip")
 yourip = input("enter your ip")
 tt=""
 numberof=0
