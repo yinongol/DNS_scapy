@@ -25,7 +25,7 @@ while True:
     hasher.update(recv)
     recvhash=hasher.hexdigest()
     if recvhash==orghash:
-        filename=input("enternametofile")
+        filename=input("enter name to file: ")
         with open(filename,"wb") as file:
             file.write(recv)
             print(f"file {filename} receive ")
