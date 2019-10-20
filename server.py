@@ -1,8 +1,8 @@
 from scapy.all import *
 import hashlib
 hasher=hashlib.md5()
-dstip="10.0.0.11"
-yourip = "10.0.0.2"  #Change to your local ip
+dstip=input("enter destination ip"
+yourip = input("enter your ip"
 tt=""
 numberof=0
 pkt=IP(src=yourip,dst=dstip)/UDP(dport=53)/DNS()/Padding(load="")
