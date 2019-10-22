@@ -3,8 +3,6 @@ import hashlib
 hasher=hashlib.md5()
 dstip=input("enter destination ip")
 yourip = input("enter your ip")
-tt=""
-numberof=0
 pkt=IP(src=yourip,dst=dstip)/UDP(dport=53)/DNS()/Padding(load="")
 def open_file():
     try:
