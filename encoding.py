@@ -3,13 +3,27 @@
 Two strategies available:
 - hex_split: Split hex-encoded data across short labels with realistic prefixes
 - wordlist: Map each byte to a short English word (lowest entropy)
+
+Sequence numbers are embedded inside the encoded data (first SEQUENCE_BYTES),
+XORed with a session key so no sequential pattern is visible.
 """
 
 import math
+import os
+import struct
 from collections import Counter
 
-# Prefixes that look like CDN/analytics URL components
-HEX_PREFIXES = ["img", "css", "js", "api", "cdn", "v1", "v2", "s", "t", "p", "a", "b"]
+# Diverse prefixes that mimic real CDN/SaaS URL patterns
+# Weighted selection to avoid uniform distribution (some prefixes are more common)
+HEX_PREFIXES = [
+    ("img", 15), ("css", 12), ("js", 12), ("api", 10),
+    ("cdn", 8), ("v1", 5), ("v2", 5), ("s", 8),
+    ("t", 6), ("p", 5), ("a", 4), ("b", 4),
+    ("f", 3), ("d", 3), ("e", 2), ("x", 2),
+    ("u", 1),
+]
+_PREFIX_NAMES = [p[0] for p in HEX_PREFIXES]
+_PREFIX_WEIGHTS = [p[1] for p in HEX_PREFIXES]
 
 # 256 common short words (3-6 chars, lowercase, DNS-safe)
 # Each word maps to one byte value (index = byte value)
@@ -45,25 +59,33 @@ WORDLIST = [
 WORD_TO_BYTE = {word: idx for idx, word in enumerate(WORDLIST)}
 
 
-def encode_hex_split(data, label_len=8):
-    """Encode bytes as hex split across short DNS labels with prefixes.
+def _pick_prefix(rng):
+    """Pick a prefix using weighted random selection."""
+    import random
+    r = rng if rng else random
+    return r.choices(_PREFIX_NAMES, weights=_PREFIX_WEIGHTS, k=1)[0]
+
+
+def encode_hex_split(data, label_len=8, rng=None):
+    """Encode bytes as hex split across short DNS labels with weighted prefixes.
 
     Each label: <prefix><hex_chars> (e.g., 'img3f2a1b')
+    Prefix selection is weighted to mimic natural CDN patterns.
     Returns list of label strings.
     """
+    import random
+    r = rng if rng else random
     hex_str = data.hex()
     labels = []
-    # Each label has a prefix (2-3 chars) + hex data
-    # We want total label length around label_len
-    prefix_idx = 0
     i = 0
     while i < len(hex_str):
-        prefix = HEX_PREFIXES[prefix_idx % len(HEX_PREFIXES)]
+        prefix = _pick_prefix(r)
         hex_chars = label_len - len(prefix)
+        if hex_chars < 2:
+            hex_chars = 2
         chunk = hex_str[i:i + hex_chars]
         labels.append(f"{prefix}{chunk}")
         i += hex_chars
-        prefix_idx += 1
     return labels
 
 
@@ -77,7 +99,6 @@ def decode_hex_split(labels):
         # Find where the prefix ends (prefixes are all-alpha, data starts with hex digit)
         for j, ch in enumerate(label):
             if ch in "0123456789abcdef" and (j == 0 or not label[j - 1].isalpha() or j > 0):
-                # Check if we're past the alpha prefix
                 if j > 0 and label[:j].isalpha():
                     hex_str += label[j:]
                     break
@@ -85,25 +106,56 @@ def decode_hex_split(labels):
                     hex_str += label
                     break
         else:
-            # All alpha - skip (shouldn't happen with valid data)
             pass
-    # Handle odd-length hex string (last chunk might be incomplete)
     if len(hex_str) % 2 != 0:
         hex_str = hex_str[:-1]
     return bytes.fromhex(hex_str)
 
 
 def encode_wordlist(data):
-    """Encode bytes using word lookup table.
-
-    Each byte maps to one word. Returns list of word labels.
-    """
+    """Encode bytes using word lookup table."""
     return [WORDLIST[b] for b in data]
 
 
 def decode_wordlist(labels):
     """Decode word labels back to bytes."""
     return bytes([WORD_TO_BYTE[word] for word in labels])
+
+
+def xor_sequence(seq_num, session_key):
+    """XOR a 2-byte sequence number with a 4-byte session key.
+
+    Returns 2 bytes that look like random data.
+    """
+    seq_bytes = struct.pack(">H", seq_num)
+    xored = bytes(a ^ b for a, b in zip(seq_bytes, session_key[:2]))
+    return xored
+
+
+def decode_xor_sequence(xored_bytes, session_key):
+    """Reverse the XOR to recover the original sequence number."""
+    seq_bytes = bytes(a ^ b for a, b in zip(xored_bytes, session_key[:2]))
+    return struct.unpack(">H", seq_bytes)[0]
+
+
+def embed_sequence(data_chunk, seq_num, session_key):
+    """Prepend XOR-obfuscated sequence number to data chunk.
+
+    The sequence is hidden within the data — no separate label needed.
+    """
+    xored_seq = xor_sequence(seq_num, session_key)
+    return xored_seq + data_chunk
+
+
+def extract_sequence(encoded_chunk, session_key):
+    """Extract and decode the sequence number from an encoded chunk.
+
+    Returns (seq_num, data_chunk).
+    """
+    xored_seq = encoded_chunk[:2]
+    data = encoded_chunk[2:]
+    seq_num = decode_xor_sequence(xored_seq, session_key)
+    return seq_num, data
 
 
 def estimate_entropy(text):
