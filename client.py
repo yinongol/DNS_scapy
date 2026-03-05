@@ -1,35 +1,69 @@
 #!/usr/bin/env python3
 """DNS File Transfer - Client (Receiver)
 
-Receives a file transmitted over DNS protocol by sniffing DNS packets
-and reassembling the file data from the Padding layer.
+Sniffs DNS queries and decodes file data from subdomain labels.
+Reassembles the file and verifies integrity with SHA-256.
+
+Expected query format:
+    <base32_data>.<seq_number>.<base_domain>
 """
 
+import base64
 import hashlib
 import sys
 
-from scapy.all import Padding, sniff
+from scapy.all import DNSQR, sniff
 
-from config import DNS_PORT, HASH_ALGORITHM, METADATA_SEPARATOR, MAX_RETRIES, SNIFF_TIMEOUT
+from config import (
+    BASE_DOMAIN,
+    DNS_PORT,
+    HASH_ALGORITHM,
+    MAX_RETRIES,
+    METADATA_SEPARATOR,
+    SNIFF_TIMEOUT,
+)
 
 
 def build_filter(src_ip, dst_ip):
     """Build BPF filter string for DNS traffic between two IPs."""
-    return f"src {src_ip} && dst {dst_ip} && port {DNS_PORT}"
+    return f"src {src_ip} && dst {dst_ip} && udp port {DNS_PORT}"
+
+
+def decode_chunk(encoded):
+    """Decode a base32-encoded DNS label back to bytes.
+
+    Re-adds padding that was stripped for DNS compatibility.
+    """
+    encoded = encoded.upper()
+    padding = (8 - len(encoded) % 8) % 8
+    encoded += "=" * padding
+    return base64.b32decode(encoded)
+
+
+def parse_query_name(qname):
+    """Extract encoded data and sequence number from a DNS query name.
+
+    Format: <encoded_data>.<seq>.<base_domain>
+    Returns: (encoded_data, sequence_number)
+    """
+    # Remove trailing dot if present (DNS FQDN)
+    if qname.endswith("."):
+        qname = qname[:-1]
+
+    parts = qname.split(".")
+    # parts: [encoded_data, seq, domain_parts...]
+    encoded_data = parts[0]
+    seq = int(parts[1])
+    return encoded_data, seq
 
 
 def parse_metadata(raw_metadata):
-    """Parse metadata string to extract chunk count and file hash.
-
-    Expected format: chunk_count||hash
-    """
-    parts = raw_metadata.split(METADATA_SEPARATOR)
+    """Parse metadata string to extract chunk count and file hash."""
+    text = raw_metadata.decode()
+    parts = text.split(METADATA_SEPARATOR)
     if len(parts) != 2:
-        raise ValueError(f"Invalid metadata format: {raw_metadata}")
-
-    chunk_count = int(parts[0])
-    file_hash = parts[1]
-    return chunk_count, file_hash
+        raise ValueError(f"Invalid metadata format: {text}")
+    return int(parts[0]), parts[1]
 
 
 def compute_hash(data):
@@ -39,54 +73,85 @@ def compute_hash(data):
     return hasher.hexdigest()
 
 
-def receive_file(src_ip, dst_ip):
-    """Receive a file over DNS packets.
+def is_our_query(pkt):
+    """Check if a packet is a DNS query targeting our base domain."""
+    if not pkt.haslayer(DNSQR):
+        return False
+    qname = pkt[DNSQR].qname.decode()
+    return qname.rstrip(".").endswith(BASE_DOMAIN)
 
-    1. Sniffs the first packet for metadata (chunk count + hash)
-    2. Sniffs the remaining packets containing file chunks
-    3. Reassembles the file and verifies integrity
-    4. Returns the reassembled data on success
+
+def receive_file(src_ip, dst_ip):
+    """Receive a file from DNS subdomain-encoded queries.
+
+    1. Sniffs DNS queries matching our base domain
+    2. Extracts sequence 0000 as metadata (chunk count + hash)
+    3. Collects all data chunks by sequence number
+    4. Reassembles and verifies integrity
     """
     bpf_filter = build_filter(src_ip, dst_ip)
-    print(f"Listening with filter: {bpf_filter}")
+    print(f"Listening: {bpf_filter}")
+    print(f"Domain: {BASE_DOMAIN}")
 
     for attempt in range(1, MAX_RETRIES + 1):
-        # Sniff metadata packet
-        print("Waiting for metadata packet...")
-        metadata_pkts = sniff(filter=bpf_filter, count=1, timeout=SNIFF_TIMEOUT)
+        # Sniff metadata packet (seq 0000)
+        print(f"\nWaiting for metadata... (attempt {attempt}/{MAX_RETRIES})")
+        meta_pkts = sniff(
+            filter=bpf_filter,
+            lfilter=is_our_query,
+            count=1,
+            timeout=SNIFF_TIMEOUT,
+        )
 
-        if not metadata_pkts:
-            print(f"Timeout waiting for metadata (attempt {attempt}/{MAX_RETRIES})")
+        if not meta_pkts:
+            print("Timeout waiting for metadata.")
             continue
 
-        raw_metadata = metadata_pkts[0].getlayer(Padding).load.decode()
-        chunk_count, original_hash = parse_metadata(raw_metadata)
-        print(f"Expecting {chunk_count} chunks, hash: {original_hash}")
+        qname = meta_pkts[0][DNSQR].qname.decode()
+        encoded_meta, seq = parse_query_name(qname)
+
+        if seq != 0:
+            print(f"Expected metadata (seq 0), got seq {seq}. Retrying...")
+            continue
+
+        raw_meta = decode_chunk(encoded_meta)
+        chunk_count, original_hash = parse_metadata(raw_meta)
+        print(f"Expecting {chunk_count} chunks")
+        print(f"Original hash: {original_hash}")
 
         # Sniff data packets
-        print(f"Receiving {chunk_count} chunks...")
-        data_pkts = sniff(filter=bpf_filter, count=chunk_count, timeout=SNIFF_TIMEOUT * chunk_count)
+        print(f"Receiving chunks...")
+        data_pkts = sniff(
+            filter=bpf_filter,
+            lfilter=is_our_query,
+            count=chunk_count,
+            timeout=SNIFF_TIMEOUT * 2,
+        )
 
         if len(data_pkts) < chunk_count:
-            print(f"Received only {len(data_pkts)}/{chunk_count} chunks (attempt {attempt}/{MAX_RETRIES})")
+            print(f"Got {len(data_pkts)}/{chunk_count} chunks. Retrying...")
             continue
 
-        # Reassemble file
-        received_data = b""
+        # Sort by sequence number and reassemble
+        chunks_by_seq = {}
         for pkt in data_pkts:
-            received_data += pkt[Padding].load
+            qname = pkt[DNSQR].qname.decode()
+            encoded, seq_num = parse_query_name(qname)
+            chunks_by_seq[seq_num] = decode_chunk(encoded)
 
-        print("Reassembly complete. Verifying integrity...")
+        received_data = b""
+        for seq_num in sorted(chunks_by_seq.keys()):
+            received_data += chunks_by_seq[seq_num]
 
-        # Verify hash
+        # Verify integrity
         received_hash = compute_hash(received_data)
         if received_hash == original_hash:
-            print("Hash verification passed.")
+            print("Hash verification PASSED.")
             return received_data
-        else:
-            print(f"Hash mismatch (attempt {attempt}/{MAX_RETRIES})")
-            print(f"  Expected: {original_hash}")
-            print(f"  Received: {received_hash}")
+
+        print(f"Hash mismatch!")
+        print(f"  Expected: {original_hash}")
+        print(f"  Got:      {received_hash}")
 
     print("Max retries exceeded. Transfer failed.")
     return None
@@ -109,7 +174,7 @@ def main():
     filename = input("Enter output filename: ").strip()
     with open(filename, "wb") as f:
         f.write(data)
-    print(f"File saved as '{filename}' ({len(data)} bytes)")
+    print(f"File saved: '{filename}' ({len(data)} bytes)")
 
 
 if __name__ == "__main__":
