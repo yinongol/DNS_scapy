@@ -16,47 +16,64 @@ from collections import Counter
 
 # 100+ diverse prefixes mimicking real CDN/SaaS/analytics URL patterns
 # Weighted to match realistic distribution of web resource naming
+#
+# DECODING RULE: The decoder scans backwards from end of label to find the
+# hex-only data suffix. The prefix MUST end with a non-hex character (g-z)
+# so the boundary is always unambiguous.
+# Hex chars: 0-9, a-f. Non-hex (safe for prefix ending): g-z.
+_HEX_CHARS = set("0123456789abcdef")
+
 HEX_PREFIXES = [
     # Static assets (common, high weight)
     ("img", 12), ("css", 10), ("js", 10), ("font", 5),
-    ("svg", 4), ("ico", 3), ("png", 3), ("woff", 2),
+    ("svg", 4), ("ico", 3), ("png", 3), ("wft", 2),
     # API/service paths
-    ("api", 8), ("v1", 5), ("v2", 4), ("v3", 2),
-    ("rpc", 3), ("ws", 3), ("gql", 2), ("rest", 2),
+    ("api", 8), ("rps", 3), ("ws", 3), ("gql", 2),
+    ("rest", 2), ("grp", 2),
+    # Version paths
+    ("vq", 5), ("vs", 4), ("vt", 2), ("vx", 1),
     # CDN/edge patterns
-    ("cdn", 6), ("edge", 4), ("cf", 4), ("ak", 3),
-    ("fb", 3), ("gt", 2), ("az", 2), ("gc", 2),
-    # Analytics/tracking (very common in real traffic)
-    ("t", 8), ("p", 6), ("s", 7), ("e", 5),
-    ("a", 5), ("b", 4), ("c", 3), ("d", 3),
-    ("f", 3), ("g", 2), ("h", 2), ("i", 2),
-    ("k", 2), ("l", 2), ("n", 2), ("r", 2),
-    ("u", 1), ("w", 1), ("x", 1), ("z", 1),
-    # Cache/content keys
+    ("hn", 4), ("ak", 3), ("gt", 2), ("ln", 2),
+    ("vn", 2), ("nw", 2), ("gw", 2),
+    # Analytics/tracking — single non-hex chars (very common in real traffic)
+    ("t", 8), ("p", 6), ("s", 7), ("g", 5),
+    ("h", 4), ("i", 3), ("k", 3), ("l", 3),
+    ("m", 3), ("n", 2), ("o", 2), ("q", 2),
+    ("r", 2), ("u", 2), ("v", 2), ("w", 1),
+    ("x", 1), ("y", 1), ("z", 1),
+    # Cache/content keys (all end with non-hex)
     ("ck", 4), ("ct", 3), ("cx", 2), ("ch", 3),
-    ("ca", 2), ("cb", 2), ("cc", 2), ("cd", 2),
-    # Session/user tracking
-    ("sid", 3), ("uid", 3), ("rid", 2), ("tid", 2),
-    ("pid", 2), ("mid", 2), ("vid", 1), ("bid", 1),
-    # Resource types
-    ("res", 3), ("src", 3), ("lib", 2), ("mod", 2),
-    ("pkg", 2), ("app", 3), ("web", 2), ("ui", 2),
-    # Data/metrics
-    ("dat", 3), ("log", 2), ("evt", 2), ("met", 2),
-    ("req", 2), ("tag", 2), ("ref", 2), ("geo", 1),
+    ("gk", 2), ("hk", 2), ("lk", 2), ("nk", 2),
+    # Session/user tracking (replaced *id -> *ix/*ip/*ir to avoid 'd' ending)
+    ("six", 3), ("uix", 3), ("rix", 2), ("tix", 2),
+    ("pix", 2), ("mix", 2), ("vix", 1), ("wix", 1),
+    # Resource types (all end with non-hex)
+    ("res", 3), ("srx", 3), ("pkg", 2), ("app", 3),
+    ("ui", 2), ("lir", 2), ("mox", 2),
+    # Data/metrics (all end with non-hex)
+    ("log", 3), ("evt", 2), ("met", 2), ("hit", 2),
+    ("msg", 2), ("tag", 2), ("geo", 1), ("rpt", 2),
     # Hashing/versioning patterns
-    ("hk", 2), ("vr", 2), ("rv", 1), ("bv", 1),
-    ("sv", 1), ("mv", 1), ("cv", 1), ("fv", 1),
-    # Common SaaS prefixes
-    ("st", 3), ("tr", 3), ("us", 2), ("eu", 2),
-    ("na", 1), ("ap", 1), ("uk", 1), ("de", 1),
-    # Ad-tech / marketing patterns
-    ("ad", 3), ("px", 2), ("cm", 2), ("dm", 2),
-    ("tr", 2), ("rt", 2), ("bk", 1), ("dg", 1),
+    ("vr", 2), ("rv", 1), ("sv", 1), ("mv", 1),
+    ("pv", 1), ("tv", 1), ("nv", 1), ("kv", 1),
+    # Common SaaS region prefixes
+    ("st", 3), ("tr", 3), ("us", 2), ("ru", 2),
+    ("jp", 1), ("kr", 1), ("uk", 1), ("sg", 1),
+    # Marketing / ad-tech
+    ("px", 3), ("rt", 2), ("mkt", 2), ("syn", 2),
+    ("yt", 2), ("tw", 1), ("ig", 1),
     # Misc short patterns
-    ("q", 2), ("m", 2), ("o", 1), ("j", 1),
-    ("y", 1), ("v", 1),
+    ("gl", 2), ("wp", 2), ("ng", 1), ("go", 1),
+    ("py", 1), ("rs", 1), ("io", 1), ("sh", 1),
 ]
+
+# Validate all prefixes: must contain a non-hex char AND end with a non-hex char
+for _p, _w in HEX_PREFIXES:
+    assert not all(ch in _HEX_CHARS for ch in _p), \
+        f"Prefix '{_p}' is hex-only! Decoder can't distinguish it from data."
+    assert _p[-1] not in _HEX_CHARS, \
+        f"Prefix '{_p}' ends with hex char '{_p[-1]}'! Decoder boundary is ambiguous."
+
 _PREFIX_NAMES = [p[0] for p in HEX_PREFIXES]
 _PREFIX_WEIGHTS = [p[1] for p in HEX_PREFIXES]
 
@@ -142,24 +159,25 @@ def encode_hex_split(data, label_len=8, min_len=None, max_len=None, rng=None):
 def decode_hex_split(labels):
     """Decode hex-split labels back to bytes.
 
-    Strips prefix (leading alpha characters) and concatenates remaining hex chars.
+    The prefix always contains at least one non-hex character (g-z).
+    We scan from the end of the label backwards to find the hex data,
+    then from the start to find where the prefix ends (first position
+    after which all remaining chars are hex).
     """
     hex_str = ""
     for label in labels:
-        # Find where prefix ends: prefix is all-alpha, data is hex
-        prefix_end = 0
-        for j, ch in enumerate(label):
-            if ch in "0123456789abcdef":
-                prefix_end = j
+        # Find the split point: prefix contains non-hex chars, data is pure hex.
+        # Scan from end to find the longest hex-only suffix.
+        split = len(label)
+        for j in range(len(label) - 1, -1, -1):
+            if label[j] in _HEX_CHARS:
+                split = j
+            else:
                 break
-        else:
-            # Label is all-alpha (no hex data) — skip
-            continue
 
-        if prefix_end > 0 and label[:prefix_end].isalpha():
-            hex_str += label[prefix_end:]
-        elif prefix_end == 0:
-            hex_str += label
+        hex_part = label[split:]
+        if hex_part:
+            hex_str += hex_part
 
     if len(hex_str) % 2 != 0:
         hex_str = hex_str[:-1]
