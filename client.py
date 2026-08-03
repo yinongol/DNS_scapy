@@ -21,7 +21,7 @@ while True:
     print("recv complete")
     for pkt in pkts:
         recv+=pkt[Padding].load
-r      hasher.update(recv)
+    hasher.update(recv)
     recvhash=hasher.hexdigest()
     if recvhash==orghash:
         filename=input("enter name to file: ")
