@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>BeamDrop — שליחה</title>
+<link rel="stylesheet" href="css/style.css" />
+<script src="vendor/qrcode.min.js"></script>
+</head>
+<body>
+<div class="wrap">
+  <header class="topbar">
+    <a class="brand" href="index.html"><span class="dot"></span>BeamDrop</a>
+    <nav>
+      <a href="send.html" class="active">שליחה</a>
+      <a href="receive.html">קבלה</a>
+    </nav>
+  </header>
+
+  <section class="card">
+    <h3>1. בחר קובץ</h3>
+    <div class="field">
+      <input id="fileInput" type="file" />
+    </div>
+
+    <details>
+      <summary>הגדרות מתקדמות</summary>
+      <div class="field section">
+        <label for="blockSize">גודל בלוק (משפיע על צפיפות ה-QR מול קלות הסריקה)</label>
+        <select id="blockSize">
+          <option value="400">קטן — 400B, QR פשוט וקל לסריקה</option>
+          <option value="700" selected>בינוני — 700B, מומלץ</option>
+          <option value="1200">גדול — 1200B, מהיר יותר אך דורש מצלמה טובה</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="fps">קצב פריימים (FPS): <span id="fpsVal">12</span></label>
+        <input id="fps" type="range" min="4" max="24" value="12" />
+      </div>
+    </details>
+  </section>
+
+  <section class="card section">
+    <h3>2. שידור</h3>
+    <div id="qrStage" class="qr-stage">
+      <canvas id="qrCanvas"></canvas>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><div class="v" id="statFrames">0</div><div class="l">פריימים נשלחו</div></div>
+      <div class="stat"><div class="v" id="statRate">0 KB/s</div><div class="l">קצב</div></div>
+      <div class="stat"><div class="v" id="statTime">00:00</div><div class="l">זמן שידור</div></div>
+    </div>
+
+    <button id="startBtn" class="btn btn-primary" disabled>התחל שידור</button>
+    <button id="stopBtn" class="btn btn-danger section" style="display:none;">עצור שידור</button>
+    <div id="status" class="status-line"></div>
+  </section>
+</div>
+
+<script type="module" src="js/send.js"></script>
+</body>
+</html>

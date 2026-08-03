@@ -1,0 +1,10 @@
+{
+  "name": "beamdrop",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "BeamDrop: screen-to-camera file transfer using animated QR codes and LT fountain codes.",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  }
+}

@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>BeamDrop — העברת קבצים באור, בלי רשת</title>
+<link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+<div class="wrap">
+  <header class="topbar">
+    <a class="brand" href="index.html"><span class="dot"></span>BeamDrop</a>
+    <nav>
+      <a href="send.html">שליחה</a>
+      <a href="receive.html">קבלה</a>
+    </nav>
+  </header>
+
+  <section class="hero">
+    <span class="badge">ללא WiFi · ללא Bluetooth · ללא רשת</span>
+    <h1>העברת קבצים דרך האור</h1>
+    <p>מכשיר אחד מציג רצף מהיר של קודי QR מונפשים, השני מצלם ומשחזר את הקובץ. עמיד לאובדן פריימים בזכות Fountain Codes — אפשר אפילו להצטרף באמצע השידור.</p>
+  </section>
+
+  <div class="grid">
+    <div class="card">
+      <h3>📤 שליחה</h3>
+      <p>בחר קובץ במכשיר השולח, והוא יוצג כרצף QR חי על המסך.</p>
+      <a class="btn btn-primary" href="send.html">התחל לשלוח</a>
+    </div>
+    <div class="card">
+      <h3>📷 קבלה</h3>
+      <p>פתח באייפון ב-Safari, כוון מצלמה למסך השולח וקלוט את הקובץ.</p>
+      <a class="btn btn-secondary" href="receive.html">התחל לקלוט</a>
+    </div>
+  </div>
+
+  <section class="section card">
+    <h3>איך זה עובד</h3>
+    <p>
+      הקובץ מפוצל לבלוקים, וכל פריים QR מכיל שילוב (XOR) אקראי-אך-דטרמיניסטי של כמה בלוקים (LT Fountain Code).
+      המקלט אוסף פריימים בכל סדר, גם עם פערים וכפילויות, ומשחזר את הקובץ ברגע שיש מספיק מידע בלתי-תלוי —
+      ומאמת שלמות באמצעות SHA-256.
+    </p>
+  </section>
+
+  <p class="footer-note">
+    דורש הרשאת מצלמה. ב-iOS Safari, גישה למצלמה מחייבת חיבור מאובטח (HTTPS או localhost) — ראו הוראות פריסה ב-README.
+  </p>
+</div>
+</body>
+</html>

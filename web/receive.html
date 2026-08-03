@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>BeamDrop — קבלה</title>
+<link rel="stylesheet" href="css/style.css" />
+<script src="vendor/jsQR.js"></script>
+</head>
+<body>
+<div class="wrap">
+  <header class="topbar">
+    <a class="brand" href="index.html"><span class="dot"></span>BeamDrop</a>
+    <nav>
+      <a href="send.html">שליחה</a>
+      <a href="receive.html" class="active">קבלה</a>
+    </nav>
+  </header>
+
+  <section class="card">
+    <h3>כוון מצלמה למסך השולח</h3>
+    <div class="video-stage">
+      <video id="video" playsinline autoplay muted></video>
+      <div class="reticle"></div>
+    </div>
+    <canvas id="scanCanvas" style="display:none;"></canvas>
+
+    <button id="startCamBtn" class="btn btn-primary">הפעל מצלמה</button>
+    <button id="stopCamBtn" class="btn btn-danger section" style="display:none;">עצור</button>
+
+    <div class="section">
+      <div class="progress"><div id="progressBar"></div></div>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><div class="v" id="statBlocks">0/0</div><div class="l">בלוקים</div></div>
+      <div class="stat"><div class="v" id="statSize">—</div><div class="l">גודל קובץ</div></div>
+      <div class="stat"><div class="v" id="statRate">0 KB/s</div><div class="l">קצב אפקטיבי</div></div>
+    </div>
+
+    <div id="status" class="status-line">ממתין להפעלת מצלמה...</div>
+    <a id="downloadLink" class="btn btn-secondary section" style="display:none;" download>הורד קובץ</a>
+  </section>
+</div>
+
+<script type="module" src="js/receive.js"></script>
+</body>
+</html>
